@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from qwen_asr import Qwen3ASRModel
+
 
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
@@ -26,12 +28,14 @@ MAX_MODEL_LEN = int(os.getenv("ASR_STREAM_MAX_MODEL_LEN", "4096"))
 MAX_NUM_SEQS = int(os.getenv("ASR_STREAM_MAX_NUM_SEQS", "1"))
 MAX_NUM_BATCHED_TOKENS = int(os.getenv("ASR_STREAM_MAX_NUM_BATCHED_TOKENS", "1024"))
 TMP_DIR = Path(os.getenv("ASR_STREAM_TMP_DIR", "/tmp/meeting-ai-asr"))
+SAMPLE_RATE = int(os.getenv("ASR_STREAM_SAMPLE_RATE", "16000"))
+SEGMENT_MAX_CHARS = int(os.getenv("ASR_STREAM_SEGMENT_MAX_CHARS", "42"))
+
 
 app = FastAPI(title="Qwen ASR Low Latency Streaming", version="1.0.0")
 asr: Qwen3ASRModel | None = None
 asr_lock = threading.Lock()
 sessions_lock = threading.Lock()
-active_session_id: str | None = None
 
 
 @dataclass
@@ -39,6 +43,8 @@ class Session:
     state: Any
     created_at: float
     last_seen: float
+    audio_seconds: float = 0.0
+    segments: list[dict[str, Any]] = field(default_factory=list)
 
 
 SESSIONS: dict[str, Session] = {}
@@ -61,15 +67,80 @@ def _get_session(session_id: str) -> Session:
         session = SESSIONS.get(session_id)
         if not session:
             raise HTTPException(status_code=409, detail="session expired or replaced")
-        if active_session_id and session_id != active_session_id:
-            SESSIONS.pop(session_id, None)
-            raise HTTPException(status_code=409, detail="session replaced")
         session.last_seen = time.time()
         return session
 
 
 def _error_detail(exc: Exception, fallback: str) -> str:
     return str(exc).strip() or fallback
+
+
+def _clean_stream_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _split_long_piece(piece: str) -> list[str]:
+    if len(piece) <= SEGMENT_MAX_CHARS:
+        return [piece]
+
+    parts: list[str] = []
+    current = ""
+    for char in piece:
+        current += char
+        if len(current) >= SEGMENT_MAX_CHARS and char in "，,、 ":
+            parts.append(current.strip())
+            current = ""
+    if current.strip():
+        parts.append(current.strip())
+
+    if any(len(part) > SEGMENT_MAX_CHARS * 1.5 for part in parts) or not parts:
+        parts = [piece[index : index + SEGMENT_MAX_CHARS].strip() for index in range(0, len(piece), SEGMENT_MAX_CHARS)]
+    return [part for part in parts if part]
+
+
+def _split_stream_text(text: str) -> list[str]:
+    cleaned = _clean_stream_text(text)
+    if not cleaned:
+        return []
+
+    pieces = [match.group(0).strip() for match in re.finditer(r"[^。！？!?；;\n]+[。！？!?；;]?", cleaned)]
+    if not pieces:
+        pieces = [cleaned]
+
+    segments: list[str] = []
+    for piece in pieces:
+        segments.extend(_split_long_piece(piece))
+    return [segment for segment in segments if segment]
+
+
+def _segments_from_text(session_id: str, text: str, total_seconds: float, language: str) -> list[dict[str, Any]]:
+    parts = _split_stream_text(text)
+    if not parts:
+        return []
+
+    total_seconds = max(0.0, total_seconds)
+    weights = [max(1, len(part)) for part in parts]
+    total_weight = max(1, sum(weights))
+    cursor = 0.0
+    output: list[dict[str, Any]] = []
+    for index, part in enumerate(parts):
+        if index == len(parts) - 1:
+            end = total_seconds
+        else:
+            end = total_seconds * sum(weights[: index + 1]) / total_weight
+        output.append(
+            {
+                "id": f"{session_id}-{index}",
+                "start": round(cursor, 2),
+                "end": round(max(cursor, end), 2),
+                "text": part,
+                "language": language or "zh",
+                "speaker": 0,
+                "source": "实时会议",
+            }
+        )
+        cursor = max(cursor, end)
+    return output
 
 
 @app.on_event("startup")
@@ -122,7 +193,6 @@ def transcriptions(
 
 @app.post("/api/start")
 def start() -> dict[str, str]:
-    global active_session_id
     if asr is None:
         raise HTTPException(status_code=503, detail="ASR model not ready")
     session_id = uuid.uuid4().hex
@@ -136,14 +206,12 @@ def start() -> dict[str, str]:
         raise HTTPException(status_code=500, detail=_error_detail(exc, "ASR 流式会话初始化失败。")) from exc
     now = time.time()
     with sessions_lock:
-        SESSIONS.clear()
         SESSIONS[session_id] = Session(state=state, created_at=now, last_seen=now)
-        active_session_id = session_id
     return {"session_id": session_id}
 
 
 @app.post("/api/chunk")
-async def chunk(request: Request, session_id: str = Query(...)) -> dict[str, str]:
+async def chunk(request: Request, session_id: str = Query(...)) -> dict[str, Any]:
     if asr is None:
         raise HTTPException(status_code=503, detail="ASR model not ready")
     session = _get_session(session_id)
@@ -155,39 +223,46 @@ async def chunk(request: Request, session_id: str = Query(...)) -> dict[str, str
         raise HTTPException(status_code=400, detail="float32 bytes length not multiple of 4")
 
     pcm = np.frombuffer(raw, dtype=np.float32).reshape(-1)
+    session.audio_seconds += float(pcm.shape[0]) / SAMPLE_RATE
     try:
         with asr_lock:
             asr.streaming_transcribe(pcm, session.state)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_error_detail(exc, "ASR 流式识别失败。")) from exc
+
+    language = getattr(session.state, "language", "") or "zh"
+    text = getattr(session.state, "text", "") or ""
+    session.segments = _segments_from_text(session_id, text, session.audio_seconds, language)
     return {
-        "language": getattr(session.state, "language", "") or "",
-        "text": getattr(session.state, "text", "") or "",
+        "language": language,
+        "text": text,
+        "segments": session.segments,
     }
 
 
 @app.post("/api/finish")
-def finish(session_id: str = Query(...)) -> dict[str, str]:
-    global active_session_id
+def finish(session_id: str = Query(...)) -> dict[str, Any]:
     if asr is None:
         raise HTTPException(status_code=503, detail="ASR model not ready")
     try:
         session = _get_session(session_id)
     except HTTPException as exc:
         if exc.status_code == 409:
-            return {"language": "", "text": ""}
+            return {"language": "", "text": "", "segments": []}
         raise
     try:
         with asr_lock:
             asr.finish_streaming_transcribe(session.state)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_error_detail(exc, "ASR 流式收尾失败。")) from exc
+    language = getattr(session.state, "language", "") or "zh"
+    text = getattr(session.state, "text", "") or ""
+    session.segments = _segments_from_text(session_id, text, session.audio_seconds, language)
     output = {
-        "language": getattr(session.state, "language", "") or "",
-        "text": getattr(session.state, "text", "") or "",
+        "language": language,
+        "text": text,
+        "segments": session.segments,
     }
     with sessions_lock:
         SESSIONS.pop(session_id, None)
-        if active_session_id == session_id:
-            active_session_id = None
     return output

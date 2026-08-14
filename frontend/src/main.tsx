@@ -500,7 +500,7 @@ function App() {
           <Mic size={26} />
           <div>
             <strong>AI 会议转写</strong>
-            <span>实时转写 / FunASR 离线处理 / AI 纪要</span>
+            <span>FunASR 实时转写 / 批量处理 / AI 纪要</span>
           </div>
         </div>
 
@@ -593,7 +593,7 @@ function App() {
             <TranscriptFeed
               className="live-output"
               emptyTitle="等待会议发言"
-              emptyText="开始会议后，Qwen ASR 会实时输出会议转写。"
+              emptyText="开始会议后，FunASR 会准实时输出带时间戳和说话人的会议转写。"
               segments={liveSegments}
             />
           </section>
