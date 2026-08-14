@@ -1,0 +1,36 @@
+backend/.venv/
+backend/storage/db.json
+backend/storage/uploads/
+frontend/node_modules/
+frontend/dist/
+*.pyc
+__pycache__/
+.DS_Store
+backend/logs/
+.venv/
+backend/logs/backend.log
+.venv/
+.venv/
+backend/logs/backend.log
+.venv/
+
+# 后端日志
+backend/logs/backend.log
+
+# 虚拟环境
+.venv/
+venv/
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+
+# 数据库和上传
+backend/storage/db.json
+backend/storage/uploads/
+
+# Python 缓存
+*.pyc
+__pycache__/
+
+# 系统文件
+.DS_Store

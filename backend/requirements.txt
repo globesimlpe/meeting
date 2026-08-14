@@ -1,0 +1,13 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+httpx==0.28.1
+python-multipart==0.0.19
+python-dotenv==1.0.1
+
+requests==2.34.2
+huggingface_hub==1.27.0
+modelscope==1.39.1
+funasr==1.4.1
+
+# GPU PyTorch for this aarch64/CUDA 13.0 host:
+# python -m pip install -U torch torchaudio --index-url https://download.pytorch.org/whl/cu130
