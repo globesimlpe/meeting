@@ -294,68 +294,118 @@ p {
   min-height: 280px;
 }
 
-.segment-list {
+.transcript-feed {
   background: #f8fafb;
   border: 1px solid #d8e0e7;
   border-radius: 8px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   max-height: 460px;
   overflow: auto;
-  padding: 12px;
+  padding: 14px;
 }
 
-.segment-row {
+.transcript-item {
   background: #ffffff;
   border: 1px solid #d8e0e7;
-  border-radius: 7px;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 88px minmax(0, 1fr);
   padding: 12px;
 }
 
-.segment-meta {
-  align-items: center;
-  color: #5c6b78;
+.transcript-time {
+  color: #6f7f8d;
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  font-size: 13px;
-  line-height: 1.4;
-  margin-bottom: 8px;
-}
-
-.segment-meta span {
-  align-items: center;
-  display: inline-flex;
+  flex-direction: column;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
   gap: 4px;
-  max-width: 100%;
-  overflow-wrap: anywhere;
+  line-height: 1.35;
 }
 
-.speaker-pill {
-  background: #e8f4ef;
-  border: 1px solid #b8d8ca;
-  border-radius: 999px;
-  color: #1f684f;
+.transcript-time span {
+  color: #172029;
   font-weight: 700;
-  min-height: 26px;
-  padding: 3px 9px;
 }
 
-.segment-row p {
+.transcript-time small {
+  color: #6f7f8d;
+  font-size: 12px;
+}
+
+.transcript-content {
+  min-width: 0;
+}
+
+.transcript-content strong {
+  color: #1f684f;
+  display: block;
+  font-size: 14px;
+  line-height: 1.4;
+  margin-bottom: 5px;
+}
+
+.transcript-content p {
   color: #172029;
   line-height: 1.7;
   overflow-wrap: anywhere;
 }
 
+.transcript-content em {
+  color: #6f7f8d;
+  display: block;
+  font-size: 12px;
+  font-style: normal;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+.live-statusbar {
+  align-items: center;
+  background: #f8fafb;
+  border: 1px solid #d8e0e7;
+  border-radius: 8px;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-height: 48px;
+  padding: 8px 12px;
+}
+
+.timer-display {
+  color: #172029;
+  font-size: 24px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.live-statusbar span {
+  color: #6f7f8d;
+  font-size: 13px;
+}
+
 .empty-transcript {
   align-items: center;
+  border: 1px dashed #cbd5df;
+  border-radius: 8px;
   color: #6f7f8d;
   display: flex;
   flex: 1;
+  flex-direction: column;
+  gap: 8px;
   justify-content: center;
   min-height: 220px;
+  padding: 18px;
   text-align: center;
+}
+
+.empty-transcript strong {
+  color: #172029;
+  font-size: 16px;
 }
 
 .summary-panel {
@@ -434,5 +484,13 @@ p {
   .transcript-output,
   .output {
     min-height: 220px;
+  }
+
+  .transcript-item {
+    grid-template-columns: 1fr;
+  }
+
+  .transcript-time {
+    flex-direction: row;
   }
 }

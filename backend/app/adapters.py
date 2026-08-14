@@ -5,12 +5,15 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
+import wave
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
 import httpx
+import numpy as np
 from dotenv import load_dotenv
 
 from .schemas import TranscriptSegment
@@ -36,9 +39,15 @@ FUNASR_SPK_MODEL = os.getenv("FUNASR_SPK_MODEL", "cam++")
 FUNASR_DEVICE = os.getenv("FUNASR_DEVICE", "cuda:0")
 FUNASR_BATCH_SIZE_S = int(os.getenv("FUNASR_BATCH_SIZE_S", "300"))
 FUNASR_MERGE_LENGTH_S = int(os.getenv("FUNASR_MERGE_LENGTH_S", "15"))
+REALTIME_ASR_PROVIDER = os.getenv("REALTIME_ASR_PROVIDER", "funasr").lower()
+REALTIME_FUNASR_INTERVAL_SEC = float(os.getenv("REALTIME_FUNASR_INTERVAL_SEC", "3.0"))
+REALTIME_FUNASR_MIN_AUDIO_SEC = float(os.getenv("REALTIME_FUNASR_MIN_AUDIO_SEC", "1.5"))
+REALTIME_FUNASR_TMP_DIR = Path(os.getenv("REALTIME_FUNASR_TMP_DIR", "/tmp/meeting-ai-funasr-stream"))
 
 _funasr_model: Any | None = None
 _funasr_lock = Lock()
+_realtime_lock = Lock()
+_realtime_sessions: dict[str, dict[str, Any]] = {}
 
 
 def _require_asr() -> str:
@@ -267,6 +276,102 @@ async def transcribe_audio(file_path: Path, offset: float = 0, source_name: str 
     return await asyncio.to_thread(_transcribe_audio_funasr_sync, file_path, source)
 
 
+def _text_from_segments(segments: list[TranscriptSegment]) -> str:
+    return "\n".join(item.text for item in segments if item.text).strip()
+
+
+def _pcm_duration(pcm_bytes: bytes) -> float:
+    return len(pcm_bytes) / 4 / 16000
+
+
+def _write_float32_wav(pcm_bytes: bytes, target: Path) -> None:
+    samples = np.frombuffer(pcm_bytes, dtype=np.float32).reshape(-1)
+    samples = np.nan_to_num(samples, nan=0.0, posinf=0.0, neginf=0.0)
+    samples = np.clip(samples, -1.0, 1.0)
+    int16 = (samples * 32767).astype(np.int16)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(target), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(int16.tobytes())
+
+
+def _transcribe_realtime_funasr_sync(session_id: str, pcm_bytes: bytes) -> list[TranscriptSegment]:
+    target = REALTIME_FUNASR_TMP_DIR / f"{session_id}.wav"
+    _write_float32_wav(pcm_bytes, target)
+    model = _get_funasr_model()
+    payload = model.generate(
+        input=str(target),
+        batch_size_s=FUNASR_BATCH_SIZE_S,
+        merge_vad=True,
+        merge_length_s=FUNASR_MERGE_LENGTH_S,
+        sentence_timestamp=True,
+    )
+    return _segments_from_funasr_payload(payload, source="实时会议")
+
+
+def _realtime_payload(segments: list[TranscriptSegment]) -> dict[str, Any]:
+    return {
+        "language": segments[0].language if segments else "zh",
+        "text": _text_from_segments(segments),
+        "segments": [item.model_dump() for item in segments],
+    }
+
+
+async def _stream_start_funasr() -> str:
+    session_id = uuid.uuid4().hex
+    now = time.time()
+    with _realtime_lock:
+        _realtime_sessions[session_id] = {
+            "pcm": bytearray(),
+            "created_at": now,
+            "updated_at": now,
+            "last_generated_duration": 0.0,
+            "segments": [],
+        }
+    return session_id
+
+
+async def _stream_chunk_funasr(session_id: str, pcm: bytes) -> dict[str, Any]:
+    if len(pcm) % 4 != 0:
+        raise RuntimeError("实时音频数据格式错误：float32 bytes length not multiple of 4。")
+    with _realtime_lock:
+        session = _realtime_sessions.get(session_id)
+        if not session:
+            return {"language": "", "text": "", "segments": []}
+        session["pcm"].extend(pcm)
+        session["updated_at"] = time.time()
+        pcm_bytes = bytes(session["pcm"])
+        duration = _pcm_duration(pcm_bytes)
+        last_duration = float(session.get("last_generated_duration") or 0)
+        cached_segments = list(session.get("segments") or [])
+
+    if duration < REALTIME_FUNASR_MIN_AUDIO_SEC or duration - last_duration < REALTIME_FUNASR_INTERVAL_SEC:
+        return _realtime_payload(cached_segments)
+
+    segments = await asyncio.to_thread(_transcribe_realtime_funasr_sync, session_id, pcm_bytes)
+    with _realtime_lock:
+        session = _realtime_sessions.get(session_id)
+        if session is not None:
+            session["segments"] = segments
+            session["last_generated_duration"] = duration
+    return _realtime_payload(segments)
+
+
+async def _stream_finish_funasr(session_id: str) -> dict[str, Any]:
+    with _realtime_lock:
+        session = _realtime_sessions.pop(session_id, None)
+    if not session:
+        return {"language": "", "text": "", "segments": []}
+    pcm_bytes = bytes(session.get("pcm") or b"")
+    cached_segments = list(session.get("segments") or [])
+    if not pcm_bytes or _pcm_duration(pcm_bytes) < REALTIME_FUNASR_MIN_AUDIO_SEC:
+        return _realtime_payload(cached_segments)
+    segments = await asyncio.to_thread(_transcribe_realtime_funasr_sync, session_id, pcm_bytes)
+    return _realtime_payload(segments)
+
+
 async def summarize_meeting(title: str, transcript_text: str) -> str:
     if not LLM_BASE_URL:
         raise RuntimeError("未配置 LLM_BASE_URL，无法生成真实 AI 纪要。")
@@ -307,6 +412,8 @@ async def summarize_meeting(title: str, transcript_text: str) -> str:
 
 
 async def stream_start() -> str:
+    if REALTIME_ASR_PROVIDER == "funasr":
+        return await _stream_start_funasr()
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(f"{ASR_STREAM_BASE_URL}/api/start")
@@ -319,7 +426,9 @@ async def stream_start() -> str:
         raise RuntimeError(f"流式 ASR 服务连接失败: {exc}") from exc
 
 
-async def stream_chunk(session_id: str, pcm: bytes) -> dict[str, str]:
+async def stream_chunk(session_id: str, pcm: bytes) -> dict[str, Any]:
+    if REALTIME_ASR_PROVIDER == "funasr":
+        return await _stream_chunk_funasr(session_id, pcm)
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
@@ -329,27 +438,29 @@ async def stream_chunk(session_id: str, pcm: bytes) -> dict[str, str]:
                 headers={"Content-Type": "application/octet-stream"},
             )
             if response.status_code == 409:
-                return {"language": "", "text": ""}
+                return {"language": "", "text": "", "segments": []}
             if response.status_code >= 400:
                 raise RuntimeError(f"流式 ASR 识别失败 {response.status_code}: {response.text}")
             payload = response.json()
-            return {"language": str(payload.get("language") or ""), "text": str(payload.get("text") or "")}
+            return {"language": str(payload.get("language") or ""), "text": str(payload.get("text") or ""), "segments": payload.get("segments") or []}
     except httpx.TimeoutException as exc:
         raise RuntimeError("流式 ASR 识别超时。") from exc
     except httpx.RequestError as exc:
         raise RuntimeError(f"流式 ASR 服务连接失败: {exc}") from exc
 
 
-async def stream_finish(session_id: str) -> dict[str, str]:
+async def stream_finish(session_id: str) -> dict[str, Any]:
+    if REALTIME_ASR_PROVIDER == "funasr":
+        return await _stream_finish_funasr(session_id)
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(f"{ASR_STREAM_BASE_URL}/api/finish", params={"session_id": session_id})
             if response.status_code == 409:
-                return {"language": "", "text": ""}
+                return {"language": "", "text": "", "segments": []}
             if response.status_code >= 400:
                 raise RuntimeError(f"流式 ASR 收尾失败 {response.status_code}: {response.text}")
             payload = response.json()
-            return {"language": str(payload.get("language") or ""), "text": str(payload.get("text") or "")}
+            return {"language": str(payload.get("language") or ""), "text": str(payload.get("text") or ""), "segments": payload.get("segments") or []}
     except httpx.TimeoutException as exc:
         raise RuntimeError("流式 ASR 收尾超时，已释放本地录音状态。") from exc
     except httpx.RequestError as exc:

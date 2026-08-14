@@ -33,6 +33,20 @@ cd /home/regchen/Chuyi/meeting-ai-mvp/backend
 ./start_streaming_asr.sh
 ```
 
+## 端口配置
+
+前后端应用端口统一放在 `config/ports.env`：
+
+```bash
+FRONTEND_HOST=0.0.0.0
+FRONTEND_PORT=5173
+BACKEND_HOST=0.0.0.0
+BACKEND_PORT=8001
+API_PROXY_HOST=127.0.0.1
+```
+
+`frontend/vite.config.ts` 会读取该文件，把 `/api` 代理到 `http://API_PROXY_HOST:BACKEND_PORT`。`backend/start.sh` 和 `frontend/start.sh` 也会读取同一个配置。模型服务端口仍在 `backend/.env` 和 `/home/regchen/Chuyi/model_run` 对应脚本中管理。
+
 ## 后端配置
 
 `backend/.env`：
@@ -64,9 +78,16 @@ FUNASR_SPK_MODEL=cam++
 FUNASR_DEVICE=cuda:0
 FUNASR_BATCH_SIZE_S=300
 FUNASR_MERGE_LENGTH_S=15
+
+REALTIME_ASR_PROVIDER=qwen
+REALTIME_FUNASR_INTERVAL_SEC=3.0
+REALTIME_FUNASR_MIN_AUDIO_SEC=1.5
+REALTIME_FUNASR_TMP_DIR=/tmp/meeting-ai-funasr-stream
 ```
 
 如果未配置对应服务地址，接口会返回错误，不会生成 mock 文本。
+
+实时转写默认使用 Qwen ASR streaming；FunASR 保留给上传长音频和批量音频做离线切段、时间戳、标点和说话人识别。
 
 
 FunASR/GPU 依赖在 `meeting-ai` 环境中安装：
@@ -92,21 +113,18 @@ cd /home/regchen/Chuyi/meeting-ai-mvp/backend
 /home/regchen/Chuyi/model_run/run_qwen36_B35_A3B_vllm.sh
 ```
 
-启动应用后端，使用 `meeting-ai` conda 环境：
+启动应用后端，使用 `meeting-ai` conda 环境并读取 `config/ports.env`：
 
 ```bash
 cd /home/regchen/Chuyi/meeting-ai-mvp/backend
-conda activate meeting-ai
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8001
+./start.sh
 ```
 
-启动前端：
+启动前端，同样读取 `config/ports.env`：
 
 ```bash
 cd /home/regchen/Chuyi/meeting-ai-mvp/frontend
-npm install
-npm run dev -- --host 0.0.0.0 --port 5173
+./start.sh
 ```
 
 访问：

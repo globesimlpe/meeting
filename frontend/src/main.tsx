@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Clock, FileAudio, Files, Loader2, Mic, Plus, RefreshCw, Sparkles, Square, Upload, Users } from "lucide-react";
+import { FileAudio, Files, Loader2, Mic, Plus, RefreshCw, Sparkles, Square, Upload, Users } from "lucide-react";
 import "./styles.css";
 
 type Meeting = {
@@ -113,6 +113,7 @@ function canUseMicrophone() {
   return Boolean(mediaDevices && typeof mediaDevices.getUserMedia === "function" && window.isSecureContext);
 }
 
+
 function downsample(input: Float32Array, sourceRate: number, targetRate: number) {
   if (sourceRate === targetRate) return input;
   const ratio = sourceRate / targetRate;
@@ -128,6 +129,32 @@ function downsample(input: Float32Array, sourceRate: number, targetRate: number)
   return output;
 }
 
+function TranscriptFeed({ segments, className = "", emptyTitle, emptyText }: { segments: Segment[]; className?: string; emptyTitle: string; emptyText: string }) {
+  return (
+    <div className={`transcript-feed ${className}`}>
+      {segments.map((segment) => (
+        <article className="transcript-item" key={segment.id}>
+          <div className="transcript-time">
+            <span>{formatSeconds(segment.start)}</span>
+            <small>{formatSeconds(segment.end)}</small>
+          </div>
+          <div className="transcript-content">
+            <strong>{speakerLabel(segment)}</strong>
+            <p>{segment.text}</p>
+            {segment.source && <em>{segment.source}</em>}
+          </div>
+        </article>
+      ))}
+      {segments.length === 0 && (
+        <div className="empty-transcript">
+          <strong>{emptyTitle}</strong>
+          <span>{emptyText}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [selectedId, setSelectedId] = useState("");
@@ -135,11 +162,13 @@ function App() {
   const [title, setTitle] = useState("");
   const [uploadText, setUploadText] = useState("");
   const [streamText, setStreamText] = useState("");
+  const [liveSegments, setLiveSegments] = useState<Segment[]>([]);
   const [summaryText, setSummaryText] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [isStartingRecording, setIsStartingRecording] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const microphoneReady = canUseMicrophone();
 
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -154,6 +183,7 @@ function App() {
   const streamMeetingIdRef = useRef("");
   const selectedIdRef = useRef("");
   const recordingActiveRef = useRef(false);
+  const liveStartedAtRef = useRef(0);
 
   const activeSegments = detail?.transcript || [];
   const currentTranscript = useMemo(() => transcriptText(detail?.transcript || []), [detail]);
@@ -183,6 +213,7 @@ function App() {
       setDetail(null);
       setUploadText("");
       setStreamText("");
+      setLiveSegments([]);
       setSummaryText("");
     }
   }
@@ -205,6 +236,7 @@ function App() {
       setTitle("");
       setUploadText("");
       setStreamText("");
+      setLiveSegments([]);
       setSummaryText("");
       await loadMeetings(meeting.id);
     });
@@ -221,9 +253,11 @@ function App() {
       });
       setUploadText(result.text);
       setStreamText("");
+      setLiveSegments([]);
       await loadDetail(detail.meeting.id);
     });
   }
+
 
   async function uploadAudioBatch(files: FileList) {
     if (!detail || files.length === 0) return;
@@ -236,6 +270,7 @@ function App() {
       });
       setUploadText(result.text);
       setStreamText("");
+      setLiveSegments([]);
       await loadDetail(detail.meeting.id);
     });
   }
@@ -283,7 +318,14 @@ function App() {
       body,
     });
     if (streamSessionIdRef.current === sessionId) {
-      setStreamText(result.text);
+      const elapsed = liveStartedAtRef.current ? (Date.now() - liveStartedAtRef.current) / 1000 : 0;
+      const nextSegments = result.segments?.length
+        ? result.segments
+        : result.text.trim()
+          ? [{ id: `live-${sessionId}`, start: 0, end: elapsed, text: result.text.trim(), language: "zh", speaker: 0, source: "实时会议" }]
+          : [];
+      setLiveSegments(nextSegments);
+      setStreamText(transcriptText(nextSegments));
     }
   }
 
@@ -318,6 +360,8 @@ function App() {
     }
     setUploadText("");
     setStreamText("");
+    setLiveSegments([]);
+    setElapsedSeconds(0);
     bufferedSamplesRef.current = [];
     pendingChunksRef.current = [];
     isPushingRef.current = false;
@@ -329,6 +373,8 @@ function App() {
       streamMeetingIdRef.current = detail.meeting.id;
       streamSessionIdRef.current = started.session_id;
       recordingActiveRef.current = true;
+      liveStartedAtRef.current = Date.now();
+      setElapsedSeconds(0);
       const AudioContextClass = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
       if (!AudioContextClass) throw new Error("当前浏览器不支持 AudioContext。");
       const audioContext = new AudioContextClass();
@@ -362,6 +408,7 @@ function App() {
     }
   }
 
+
   function stopRecording() {
     const meetingId = streamMeetingIdRef.current;
     const sessionId = streamSessionIdRef.current;
@@ -382,10 +429,12 @@ function App() {
       if (meetingId && sessionId) {
         const result = await withTimeout(
           api<TranscriptionResult>(`/meetings/${meetingId}/stream/finish?session_id=${encodeURIComponent(sessionId)}`, { method: "POST" }),
-          5000,
+          120000,
           "停止录音超时，已释放本地录音状态。"
         );
-        setStreamText(result.text);
+        const finalSegments = result.segments?.length ? result.segments : [];
+        setLiveSegments(finalSegments);
+        setStreamText(transcriptText(finalSegments));
       }
     };
 
@@ -401,6 +450,7 @@ function App() {
       recordingActiveRef.current = false;
       bufferedSamplesRef.current = [];
       pendingChunksRef.current = [];
+      liveStartedAtRef.current = 0;
       loadDetail(meetingId || selectedIdRef.current).catch((err) => setError(String(err)));
     });
   }
@@ -435,6 +485,14 @@ function App() {
     }
   }, [selectedId]);
 
+  useEffect(() => {
+    if (!isRecording) return;
+    const timer = window.setInterval(() => {
+      setElapsedSeconds(liveStartedAtRef.current ? (Date.now() - liveStartedAtRef.current) / 1000 : 0);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [isRecording]);
+
   return (
     <main className="app">
       <aside className="sidebar">
@@ -442,7 +500,7 @@ function App() {
           <Mic size={26} />
           <div>
             <strong>AI 会议转写</strong>
-            <span>实时转写 / FunASR 长音频 / AI 纪要</span>
+            <span>实时转写 / FunASR 离线处理 / AI 纪要</span>
           </div>
         </div>
 
@@ -528,7 +586,16 @@ function App() {
                 </button>
               )}
             </div>
-            <textarea className="output live-output" value={streamText} readOnly placeholder="实时转写文字会直接输出到这里。" />
+            <div className="live-statusbar">
+              <div className="timer-display">{formatSeconds(elapsedSeconds)}</div>
+              <span>{liveSegments.length ? `${liveSegments.length} 句实时转写` : "等待发言"}</span>
+            </div>
+            <TranscriptFeed
+              className="live-output"
+              emptyTitle="等待会议发言"
+              emptyText="开始会议后，Qwen ASR 会实时输出会议转写。"
+              segments={liveSegments}
+            />
           </section>
 
           <section className="panel upload-panel">
@@ -581,19 +648,12 @@ function App() {
               </div>
               <Users size={22} />
             </div>
-            <div className="segment-list transcript-output">
-              {activeSegments.map((segment) => (
-                <article className="segment-row" key={segment.id}>
-                  <div className="segment-meta">
-                    <span className="speaker-pill">{speakerLabel(segment)}</span>
-                    <span><Clock size={14} />{formatSeconds(segment.start)} - {formatSeconds(segment.end)}</span>
-                    {segment.source && <span>{segment.source}</span>}
-                  </div>
-                  <p>{segment.text}</p>
-                </article>
-              ))}
-              {activeSegments.length === 0 && <div className="empty-transcript">当前会议暂无转写结果。</div>}
-            </div>
+            <TranscriptFeed
+              className="transcript-output"
+              emptyTitle="当前会议暂无转写结果"
+              emptyText="实时录音或上传音频后，这里会按时间顺序显示每句话。"
+              segments={activeSegments}
+            />
           </section>
 
           <section className="panel summary-panel">

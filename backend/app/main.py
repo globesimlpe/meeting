@@ -89,6 +89,38 @@ def _error_detail(exc: Exception, fallback: str) -> str:
     return str(exc).strip() or fallback
 
 
+def _segments_from_stream_payload(payload: dict, session_id: str) -> list[TranscriptSegment]:
+    raw_segments = payload.get("segments")
+    if isinstance(raw_segments, list) and raw_segments:
+        segments: list[TranscriptSegment] = []
+        for index, item in enumerate(raw_segments):
+            try:
+                segment = TranscriptSegment(**item)
+            except Exception:
+                continue
+            if not segment.text.strip():
+                continue
+            if not segment.id:
+                segment.id = f"{session_id}-{index}"
+            segments.append(segment)
+        return segments
+
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return []
+    return [
+        TranscriptSegment(
+            id=session_id,
+            start=float(payload.get("start") or 0),
+            end=float(payload.get("end") or 0),
+            text=text,
+            language=payload.get("language") or "zh",
+            speaker=0,
+            source="实时会议",
+        )
+    ]
+
+
 @app.post("/api/meetings/{meeting_id}/audio", response_model=AudioTranscriptionResult)
 async def upload_audio(meeting_id: str, file: UploadFile = File(...)) -> AudioTranscriptionResult:
     if not get_meeting(meeting_id):
@@ -177,10 +209,8 @@ async def push_low_latency_stream_chunk(
         update_meeting_status(meeting_id, "实时转写失败")
         raise HTTPException(status_code=502, detail=_error_detail(exc, "流式 ASR 识别失败，后端没有返回具体错误。")) from exc
 
-    text = payload["text"].strip()
-    segments = [
-        TranscriptSegment(id=session_id, start=0, end=0, text=text, language=payload.get("language") or "zh", speaker=0)
-    ] if text else []
+    segments = _segments_from_stream_payload(payload, session_id)
+    text = _plain_text(segments)
     replace_transcript(meeting_id, segments)
     return AudioTranscriptionResult(text=text, segments=segments)
 
@@ -195,10 +225,8 @@ async def finish_low_latency_stream(meeting_id: str, session_id: str = Query(...
         update_meeting_status(meeting_id, "实时转写失败")
         raise HTTPException(status_code=502, detail=_error_detail(exc, "流式 ASR 收尾失败，后端没有返回具体错误。")) from exc
 
-    text = payload["text"].strip()
-    segments = [
-        TranscriptSegment(id=session_id, start=0, end=0, text=text, language=payload.get("language") or "zh", speaker=0)
-    ] if text else []
+    segments = _segments_from_stream_payload(payload, session_id)
+    text = _plain_text(segments)
     replace_transcript(meeting_id, segments)
     update_meeting_status(meeting_id, "转写完成")
     return AudioTranscriptionResult(text=text, segments=segments)
