@@ -34,3 +34,5 @@ __pycache__/
 
 # 系统文件
 .DS_Store
+frontend/logs/frontend.log
+frontend/logs/frontend.pid
