@@ -1,0 +1,138 @@
+{
+  "meeting": {
+    "id": "8268f13645de414aa3b5683d44ec4e9d",
+    "title": "测试1",
+    "status": "纪要已生成",
+    "created_at": "2026-08-17T02:06:54.666372+00:00"
+  },
+  "transcript": [
+    {
+      "id": "4d01af118e064786b7803b95992c8a5a-4d01af118e064786b7803b95992c8a5a-0",
+      "start": 0.0,
+      "end": 5.81,
+      "text": "你这个报告上显示了这个，后来我就找了一医生，真的是这样。",
+      "language": "Chinese",
+      "speaker": 1,
+      "source": "实时会议"
+    },
+    {
+      "id": "4d01af118e064786b7803b95992c8a5a-4d01af118e064786b7803b95992c8a5a-1",
+      "start": 5.81,
+      "end": 10.17,
+      "text": "就我觉得这是现在用的比较多的一些这个场景。",
+      "language": "Chinese",
+      "speaker": 1,
+      "source": "实时会议"
+    },
+    {
+      "id": "4d01af118e064786b7803b95992c8a5a-4d01af118e064786b7803b95992c8a5a-2",
+      "start": 10.17,
+      "end": 19.5,
+      "text": "就是想约想记录一下，因为啊我看您的书啊，包括您的论文，也提到在您过去嗯二十年的职业生涯里，",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "4d01af118e064786b7803b95992c8a5a-4d01af118e064786b7803b95992c8a5a-3",
+      "start": 19.5,
+      "end": 23.24,
+      "text": "感受到了好几次世界真的不一样的时刻。",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "4d01af118e064786b7803b95992c8a5a-4d01af118e064786b7803b95992c8a5a-4",
+      "start": 23.24,
+      "end": 31.12,
+      "text": "然后这一次来讲呢，您觉得是不是真的到了这个节点，这个世界已经开始被AI开始。",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "4d01af118e064786b7803b95992c8a5a-4d01af118e064786b7803b95992c8a5a-5",
+      "start": 31.12,
+      "end": 38.8,
+      "text": "我过去一开始在做高清电视和媒体，后来做啊，计算啊，互联网啊，等等啊，一般。",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "4d01af118e064786b7803b95992c8a5a-4d01af118e064786b7803b95992c8a5a-6",
+      "start": 38.8,
+      "end": 47.51,
+      "text": "那过去呢，我做了很多的一些预测吧，我的预测呢可能百分之五十正确，百分之五十是错的啊。",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "4d01af118e064786b7803b95992c8a5a-4d01af118e064786b7803b95992c8a5a-7",
+      "start": 47.51,
+      "end": 50.0,
+      "text": "然后在我预测正确的往往。",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "2c336c4c831d42bba5e257a65eea4284-2c336c4c831d42bba5e257a65eea4284-0",
+      "start": 50.0,
+      "end": 61.36,
+      "text": "我预测的都发生的要早的，但这次在AI呢，很多我的预测啊，跟我真正发生的预测的有差距。",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "2c336c4c831d42bba5e257a65eea4284-2c336c4c831d42bba5e257a65eea4284-1",
+      "start": 61.36,
+      "end": 71.1,
+      "text": "比如说这次智能体，去年在讲这个智能体时代，从鉴别AI到深度AI到智能体。",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "2c336c4c831d42bba5e257a65eea4284-2c336c4c831d42bba5e257a65eea4284-2",
+      "start": 71.1,
+      "end": 78.68,
+      "text": "那我本来想可能再过个三五年，那呢可以啊，智能体大相奔涌。",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "2c336c4c831d42bba5e257a65eea4284-2c336c4c831d42bba5e257a65eea4284-3",
+      "start": 78.68,
+      "end": 82.2,
+      "text": "没有没有想到，这个很先进。",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "2c336c4c831d42bba5e257a65eea4284-2c336c4c831d42bba5e257a65eea4284-4",
+      "start": 82.2,
+      "end": 88.69,
+      "text": "啊，要有准备，不能说哦，呃，这个各位都搞过是吧？",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    },
+    {
+      "id": "2c336c4c831d42bba5e257a65eea4284-2c336c4c831d42bba5e257a65eea4284-5",
+      "start": 88.69,
+      "end": 93.56,
+      "text": "我经常在一块儿也问，因为选择的是大。",
+      "language": "Chinese",
+      "speaker": 0,
+      "source": "实时会议"
+    }
+  ],
+  "summary": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Role:** 会议纪要助手 (Meeting Minutes Assistant)\n   - **Task:** Generate concise Chinese meeting minutes from a multi-person verbatim transcript.\n   - **Output Requirements:** Only output the main text, NO Markdown code blocks. Structure must include: 1. 会议摘要 (Meeting Summary); 2. 关键结论 (Key Conclusions); 3. 待跟进事项 (Follow-up Items). Use \"暂无\" (None) for parts without clear content. Use speaker and timestamp to infer context.\n   - **Input Data:**\n     - Title: 测试1 (Test 1)\n     - Transcript: Short excerpt (00:00-01:33), mostly Speaker 0 talking about AI predictions, past career (HD TV, media, computing, internet), accuracy of predictions, and the unexpected speed of AI development (specifically mentioning \"智能体\" / agents). Speaker 1 makes a brief comment at the beginning about a report and a doctor.\n\n2.  **Analyze Transcript Content:**\n   - `[00:00-00:05] S1`: Mentions a report showing something, consulted a doctor, confirms it.\n   - `[00:05-00:10] S1`: Mentions current common scenarios.\n   - `[00:10-00:38] S0`: Asks/reflects on the speaker's 20-year career, noting several \"world-changing\" moments. Asks if AI marks a new node where the world is being reshaped. Mentions past work in HD TV, media, computing, internet.\n   - `[00:38-01:01] S0`: Discusses past predictions (50% right, 50% wrong). Right predictions usually happened earlier than expected. But AI predictions have a gap with reality.\n   - `[01:01-01:22] S0`: Gives an example: \"Agent era\" (智能体时代). Predicted it would take 3-5 years for agents to flourish, but it happened much faster than expected.\n   - `[01:22-01:33] S0`: Mentions needing to prepare. Asks a question about choosing a large scope/target. (Transcript cuts off, seems incomplete).\n   - *Context Inference:* This looks like an interview or a Q&A session where Speaker 0 is interviewing Speaker 1 (or vice versa, but the phrasing \"我看您的书啊，包括您的论文\" suggests S0 is addressing S1 as an expert/author). The core topic is AI's rapid development, specifically the \"Agent\" trend, and how it's outpacing predictions. S1 briefly validates a report/doctor comment at the start.\n\n3.  **Draft - Section by Section (Mental Refinement):**\n   - **1. 会议摘要:** 会议围绕AI技术演进及其对行业的影响展开讨论。主讲人回顾了自身在高清电视、媒体、计算及互联网领域的二十年从业经验，分享了过往技术预测的准确性规律。重点探讨了AI（尤其是智能体/Agent）发展速度远超预期的现状，指出当前可能正处于AI重塑世界的关键节点，并强调需提前做好准备。\n   - **2. 关键结论:**\n     - AI发展速度显著快于过往预测，尤其是智能体（Agent）技术的爆发式进展超出预期。\n     - 当前可能已到达AI深刻改变行业与世界的关键节点。\n     - 面对AI的快速演进，相关从业者需提前布局并做好应对准备。\n   - **3. 待跟进事项:** 暂无（原文未提及具体待办或后续计划，仅停留在观点探讨与现状分析阶段）。\n\n4.  **Check against Constraints:**\n   - Concise Chinese? Yes.\n   - Only output main text, NO Markdown code blocks? I will ensure the output is plain text, but I can use standard numbering/bullet points as requested. The prompt says \"不要 Markdown 代码块\" (do not use Markdown code blocks like ```), but standard formatting is fine. I'll avoid `**` or `#` just to be safe, or keep it minimal. Actually, the prompt says \"只输出正文，不要 Markdown 代码块\", so I will output plain text with clear structure.\n   - Structure: 1. 会议摘要；2. 关键结论；3. 待跟进事项。\n   - \"暂无\" for unclear parts? Yes.\n   - Context inferred correctly? Yes.\n\n   Let's refine the output to strictly match the prompt's formatting request without markdown formatting if possible, or just standard text. I'll use plain text with line breaks.\n\n   Draft:\n   1. 会议摘要\n   本次会议围绕人工智能技术的演进及其对行业的影响展开探讨。主讲人结合自身在高清电视、媒体、计算及互联网领域二十年的从业经验，回顾了过往技术预测的规律。会议重点分析了AI（尤其是智能体/Agent）发展速度远超预期的现状，指出当前可能已步入AI重塑世界的关键节点，并强调行业需提前做好准备。\n\n   2. 关键结论\n   - AI技术迭代速度显著快于历史预测，智能体（Agent）等前沿应用的爆发式进展超出预期。\n   - 当前可能已到达AI深刻改变行业格局与生活方式的关键节点。\n   - 面对AI的快速演进，相关从业者与机构需提前布局，做好技术与业务层面的准备。\n\n   3. 待跟进事项\n   暂无\n\n   Check constraints:",
+  "files": []
+}

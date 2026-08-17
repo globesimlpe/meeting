@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import shutil
 import uuid
+import wave
 from pathlib import Path
+from threading import Lock
+from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
 
-from .adapters import stream_chunk, stream_finish, stream_start, summarize_meeting, transcribe_audio
+from .adapters import stream_chunk, stream_finish, stream_start, stream_status, summarize_meeting, transcribe_audio
 from .schemas import AudioTranscriptionResult, Meeting, MeetingCreate, MeetingDetail, SummaryResult, TranscriptSegment
 from .store import (
-    UPLOAD_DIR,
     create_meeting,
     get_meeting,
+    ensure_meeting_storage,
     read_db,
+    register_meeting_file,
     replace_transcript,
     save_summary,
     update_meeting_status,
@@ -21,6 +26,10 @@ from .store import (
 
 
 app = FastAPI(title="AI Meeting Transcription", version="1.0.0")
+
+STREAM_SAMPLE_RATE = 16000
+_stream_recordings: dict[str, dict[str, Any]] = {}
+_stream_recordings_lock = Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,10 +70,80 @@ def get_meeting_detail(meeting_id: str) -> dict:
 
 def _save_upload(meeting_id: str, file: UploadFile, prefix: str) -> Path:
     suffix = Path(file.filename or "audio.webm").suffix or ".webm"
-    target = UPLOAD_DIR / f"{meeting_id}-{prefix}-{uuid.uuid4().hex}{suffix}"
+    target_dir = ensure_meeting_storage(meeting_id)
+    target = target_dir / f"{prefix}-{uuid.uuid4().hex}{suffix}"
     with target.open("wb") as output:
         shutil.copyfileobj(file.file, output)
+    register_meeting_file(meeting_id, target.name)
     return target
+
+
+def _stream_recording_paths(meeting_id: str, session_id: str) -> tuple[Path, Path]:
+    target_dir = ensure_meeting_storage(meeting_id)
+    safe_session_id = "".join(char for char in session_id if char.isalnum()) or uuid.uuid4().hex
+    raw_path = target_dir / f".stream-{safe_session_id}.f32.tmp"
+    wav_path = target_dir / f"stream-{safe_session_id}.wav"
+    return raw_path, wav_path
+
+
+def _start_stream_recording(meeting_id: str, session_id: str) -> None:
+    raw_path, wav_path = _stream_recording_paths(meeting_id, session_id)
+    raw_path.write_bytes(b"")
+    with _stream_recordings_lock:
+        _stream_recordings[session_id] = {
+            "meeting_id": meeting_id,
+            "raw_path": raw_path,
+            "wav_path": wav_path,
+        }
+
+
+def _append_stream_recording(meeting_id: str, session_id: str, pcm: bytes) -> None:
+    if len(pcm) % 4 != 0:
+        raise HTTPException(status_code=400, detail="实时音频数据格式错误：Float32 PCM 字节长度不是 4 的倍数。")
+    with _stream_recordings_lock:
+        recording = _stream_recordings.get(session_id)
+        if not recording or recording.get("meeting_id") != meeting_id:
+            return
+        raw_path = Path(recording["raw_path"])
+        with raw_path.open("ab") as output:
+            output.write(pcm)
+
+
+def _write_stream_wav(raw_path: Path, wav_path: Path) -> None:
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    with raw_path.open("rb") as source, wave.open(str(wav_path), "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(STREAM_SAMPLE_RATE)
+        while True:
+            chunk = source.read(STREAM_SAMPLE_RATE * 4 * 30)
+            if not chunk:
+                break
+            usable_length = len(chunk) - (len(chunk) % 4)
+            if usable_length <= 0:
+                continue
+            samples = np.frombuffer(chunk[:usable_length], dtype="<f4")
+            samples = np.nan_to_num(samples, nan=0.0, posinf=0.0, neginf=0.0)
+            samples = np.clip(samples, -1.0, 1.0)
+            target.writeframes((samples * 32767).astype("<i2").tobytes())
+
+
+def _finish_stream_recording(meeting_id: str, session_id: str) -> str | None:
+    with _stream_recordings_lock:
+        recording = _stream_recordings.pop(session_id, None)
+    if not recording or recording.get("meeting_id") != meeting_id:
+        return None
+
+    raw_path = Path(recording["raw_path"])
+    wav_path = Path(recording["wav_path"])
+    try:
+        if not raw_path.exists() or raw_path.stat().st_size == 0:
+            return None
+        _write_stream_wav(raw_path, wav_path)
+        register_meeting_file(meeting_id, wav_path.name)
+        return wav_path.name
+    finally:
+        raw_path.unlink(missing_ok=True)
 
 
 def _format_clock(seconds: float) -> str:
@@ -119,6 +198,17 @@ def _segments_from_stream_payload(payload: dict, session_id: str) -> list[Transc
             source="实时会议",
         )
     ]
+
+
+def _stream_result(payload: dict, session_id: str) -> AudioTranscriptionResult:
+    segments = _segments_from_stream_payload(payload, session_id)
+    text = _plain_text(segments)
+    return AudioTranscriptionResult(
+        text=text,
+        segments=segments,
+        speaker_ready=bool(payload.get("speaker_ready")),
+        speaker_status=str(payload.get("speaker_status") or ""),
+    )
 
 
 @app.post("/api/meetings/{meeting_id}/audio", response_model=AudioTranscriptionResult)
@@ -188,6 +278,7 @@ async def start_low_latency_stream(meeting_id: str) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="Meeting not found")
     try:
         session_id = await stream_start()
+        _start_stream_recording(meeting_id, session_id)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=_error_detail(exc, "流式 ASR 启动失败，后端没有返回具体错误。")) from exc
     replace_transcript(meeting_id, [])
@@ -204,29 +295,49 @@ async def push_low_latency_stream_chunk(
     if not get_meeting(meeting_id):
         raise HTTPException(status_code=404, detail="Meeting not found")
     try:
-        payload = await stream_chunk(session_id, await request.body())
+        body = await request.body()
+        _append_stream_recording(meeting_id, session_id, body)
+        payload = await stream_chunk(session_id, body)
+    except HTTPException:
+        raise
     except Exception as exc:
         update_meeting_status(meeting_id, "实时转写失败")
         raise HTTPException(status_code=502, detail=_error_detail(exc, "流式 ASR 识别失败，后端没有返回具体错误。")) from exc
 
-    segments = _segments_from_stream_payload(payload, session_id)
-    text = _plain_text(segments)
-    replace_transcript(meeting_id, segments)
-    return AudioTranscriptionResult(text=text, segments=segments)
+    result = _stream_result(payload, session_id)
+    if result.segments:
+        replace_transcript(meeting_id, result.segments)
+    return result
+
+
+@app.get("/api/meetings/{meeting_id}/stream/status", response_model=AudioTranscriptionResult)
+async def get_low_latency_stream_status(meeting_id: str, session_id: str = Query(...)) -> AudioTranscriptionResult:
+    if not get_meeting(meeting_id):
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    try:
+        payload = await stream_status(session_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=_error_detail(exc, "流式 ASR 状态读取失败，后端没有返回具体错误。")) from exc
+
+    result = _stream_result(payload, session_id)
+    if result.segments:
+        replace_transcript(meeting_id, result.segments)
+    return result
 
 
 @app.post("/api/meetings/{meeting_id}/stream/finish", response_model=AudioTranscriptionResult)
 async def finish_low_latency_stream(meeting_id: str, session_id: str = Query(...)) -> AudioTranscriptionResult:
     if not get_meeting(meeting_id):
         raise HTTPException(status_code=404, detail="Meeting not found")
+    recorded_file = _finish_stream_recording(meeting_id, session_id)
     try:
         payload = await stream_finish(session_id)
     except Exception as exc:
         update_meeting_status(meeting_id, "实时转写失败")
         raise HTTPException(status_code=502, detail=_error_detail(exc, "流式 ASR 收尾失败，后端没有返回具体错误。")) from exc
 
-    segments = _segments_from_stream_payload(payload, session_id)
-    text = _plain_text(segments)
-    replace_transcript(meeting_id, segments)
+    result = _stream_result(payload, session_id)
+    result.files = [recorded_file] if recorded_file else []
+    replace_transcript(meeting_id, result.segments)
     update_meeting_status(meeting_id, "转写完成")
-    return AudioTranscriptionResult(text=text, segments=segments)
+    return result

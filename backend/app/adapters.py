@@ -27,6 +27,9 @@ ASR_MODEL = os.getenv("ASR_MODEL", "/home/regchen/Chuyi/models/Qwen3-ASR-0.6B")
 ASR_TRANSCRIBE_PATH = os.getenv("ASR_TRANSCRIBE_PATH", "/v1/audio/transcriptions")
 ASR_MAX_RETRIES = int(os.getenv("ASR_MAX_RETRIES", "2"))
 ASR_STREAM_BASE_URL = os.getenv("ASR_STREAM_BASE_URL", "http://127.0.0.1:8005").rstrip("/")
+ASR_STREAM_START_TIMEOUT_SEC = float(os.getenv("ASR_STREAM_START_TIMEOUT_SEC", "20"))
+ASR_STREAM_CHUNK_TIMEOUT_SEC = float(os.getenv("ASR_STREAM_CHUNK_TIMEOUT_SEC", "45"))
+ASR_STREAM_FINISH_TIMEOUT_SEC = float(os.getenv("ASR_STREAM_FINISH_TIMEOUT_SEC", "45"))
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "EMPTY")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.6-35B-A3B-NVFP4")
@@ -46,9 +49,11 @@ REALTIME_FUNASR_TMP_DIR = Path(os.getenv("REALTIME_FUNASR_TMP_DIR", "/tmp/meetin
 REALTIME_SPEAKER_PROVIDER = os.getenv("REALTIME_SPEAKER_PROVIDER", "off").lower()
 REALTIME_SPEAKER_INTERVAL_SEC = float(os.getenv("REALTIME_SPEAKER_INTERVAL_SEC", "3.0"))
 REALTIME_SPEAKER_MIN_AUDIO_SEC = float(os.getenv("REALTIME_SPEAKER_MIN_AUDIO_SEC", "2.0"))
+REALTIME_QWEN_ROTATE_SEC = float(os.getenv("REALTIME_QWEN_ROTATE_SEC", "50.0"))
 
 _funasr_model: Any | None = None
 _funasr_lock = Lock()
+_funasr_generate_lock = Lock()
 _realtime_lock = Lock()
 _realtime_sessions: dict[str, dict[str, Any]] = {}
 
@@ -235,13 +240,14 @@ def _get_funasr_model() -> Any:
 def _transcribe_audio_funasr_sync(file_path: Path, source: str) -> list[TranscriptSegment]:
     asr_file = _convert_to_wav(file_path)
     model = _get_funasr_model()
-    payload = model.generate(
-        input=str(asr_file),
-        batch_size_s=FUNASR_BATCH_SIZE_S,
-        merge_vad=True,
-        merge_length_s=FUNASR_MERGE_LENGTH_S,
-        sentence_timestamp=True,
-    )
+    with _funasr_generate_lock:
+        payload = model.generate(
+            input=str(asr_file),
+            batch_size_s=FUNASR_BATCH_SIZE_S,
+            merge_vad=True,
+            merge_length_s=FUNASR_MERGE_LENGTH_S,
+            sentence_timestamp=True,
+        )
     return _segments_from_funasr_payload(payload, source=source)
 
 
@@ -304,13 +310,14 @@ def _transcribe_realtime_funasr_sync(session_id: str, pcm_bytes: bytes) -> list[
     target = REALTIME_FUNASR_TMP_DIR / f"{session_id}.wav"
     _write_float32_wav(pcm_bytes, target)
     model = _get_funasr_model()
-    payload = model.generate(
-        input=str(target),
-        batch_size_s=FUNASR_BATCH_SIZE_S,
-        merge_vad=True,
-        merge_length_s=FUNASR_MERGE_LENGTH_S,
-        sentence_timestamp=True,
-    )
+    with _funasr_generate_lock:
+        payload = model.generate(
+            input=str(target),
+            batch_size_s=FUNASR_BATCH_SIZE_S,
+            merge_vad=True,
+            merge_length_s=FUNASR_MERGE_LENGTH_S,
+            sentence_timestamp=True,
+        )
     return _segments_from_funasr_payload(payload, source="实时会议")
 
 
@@ -324,6 +331,77 @@ def _realtime_payload(segments: list[TranscriptSegment]) -> dict[str, Any]:
 
 def _speaker_overlap(start: float, end: float, turn: TranscriptSegment) -> float:
     return max(0.0, min(end, turn.end) - max(start, turn.start))
+
+
+def _speaker_enabled() -> bool:
+    return REALTIME_SPEAKER_PROVIDER in {"funasr_campp", "funasr", "campp"}
+
+
+def _offset_raw_segments(raw_segments: Any, offset: float, prefix: str) -> list[dict[str, Any]]:
+    if not isinstance(raw_segments, list):
+        return []
+    output: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_segments):
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("text") or "").strip()
+        if not text:
+            continue
+        item = dict(raw)
+        try:
+            start = float(item.get("start") or 0)
+            end = float(item.get("end") or start)
+        except (TypeError, ValueError):
+            start = 0.0
+            end = 0.0
+        item["id"] = f"{prefix}-{item.get('id') or index}"
+        item["start"] = round(start + offset, 2)
+        item["end"] = round(max(start, end) + offset, 2)
+        item["text"] = text
+        item["source"] = item.get("source") or "实时会议"
+        output.append(item)
+    return output
+
+
+def _qwen_payload_segments(payload: dict[str, Any], offset: float, prefix: str) -> list[dict[str, Any]]:
+    segments = _offset_raw_segments(payload.get("segments"), offset, prefix)
+    if segments:
+        return segments
+    text = _clean_asr_text(str(payload.get("text") or ""))
+    if not text:
+        return []
+    return [
+        {
+            "id": f"{prefix}-text",
+            "start": round(offset, 2),
+            "end": round(offset, 2),
+            "text": text,
+            "language": str(payload.get("language") or "zh"),
+            "speaker": 0,
+            "source": "实时会议",
+        }
+    ]
+
+
+def _qwen_combined_payload(
+    current_payload: dict[str, Any],
+    finished_segments: list[dict[str, Any]],
+    offset: float,
+    prefix: str,
+    speaker_segments: list[TranscriptSegment],
+    speaker_status: str = "",
+) -> dict[str, Any]:
+    current_segments = _qwen_payload_segments(current_payload, offset, prefix)
+    raw_segments = [dict(item) for item in finished_segments] + current_segments
+    segments = _assign_speakers_to_stream_segments(raw_segments, speaker_segments) if raw_segments else []
+    text = "\n".join(str(item.get("text") or "").strip() for item in segments if str(item.get("text") or "").strip())
+    return {
+        "language": str(current_payload.get("language") or "zh"),
+        "text": text or str(current_payload.get("text") or ""),
+        "segments": segments,
+        "speaker_ready": bool(speaker_segments),
+        "speaker_status": speaker_status,
+    }
 
 
 def _assign_speakers_to_stream_segments(raw_segments: list[Any], speaker_segments: list[TranscriptSegment]) -> list[dict[str, Any]]:
@@ -353,76 +431,109 @@ def _assign_speakers_to_stream_segments(raw_segments: list[Any], speaker_segment
     return assigned
 
 
-def _qwen_stream_payload(payload: dict[str, Any], speaker_segments: list[TranscriptSegment]) -> dict[str, Any]:
-    raw_segments = payload.get("segments") or []
-    if isinstance(raw_segments, list) and raw_segments:
-        segments = _assign_speakers_to_stream_segments(raw_segments, speaker_segments)
-    else:
-        segments = []
-    return {
-        "language": str(payload.get("language") or ""),
-        "text": str(payload.get("text") or ""),
-        "segments": segments,
-    }
+def _qwen_stream_payload(
+    payload: dict[str, Any],
+    speaker_segments: list[TranscriptSegment],
+    speaker_status: str = "",
+) -> dict[str, Any]:
+    return _qwen_combined_payload(payload, [], 0.0, "qwen", speaker_segments, speaker_status)
 
 
-def _start_qwen_speaker_session(session_id: str) -> None:
-    if REALTIME_SPEAKER_PROVIDER not in {"funasr_campp", "funasr", "campp"}:
-        return
+def _start_qwen_session(session_id: str, qwen_session_id: str) -> None:
     now = time.time()
     with _realtime_lock:
         _realtime_sessions[session_id] = {
+            "provider": "qwen",
+            "qwen_session_id": qwen_session_id,
+            "qwen_offset": 0.0,
+            "qwen_current_duration": 0.0,
+            "qwen_current_payload": {},
+            "qwen_finished_segments": [],
             "pcm": bytearray(),
             "created_at": now,
             "updated_at": now,
             "last_speaker_duration": 0.0,
             "speaker_segments": [],
+            "speaker_running": False,
+            "speaker_revision": 0,
+            "speaker_status": "collecting",
+            "latest_payload": {},
         }
 
 
-def _append_qwen_speaker_audio(session_id: str, pcm: bytes) -> tuple[bytes, float, float, list[TranscriptSegment]]:
-    if REALTIME_SPEAKER_PROVIDER not in {"funasr_campp", "funasr", "campp"}:
-        return b"", 0.0, 0.0, []
+def _record_qwen_chunk(session_id: str, pcm: bytes, payload: dict[str, Any]) -> tuple[list[TranscriptSegment], tuple[bytes, float] | None, str]:
     if len(pcm) % 4 != 0:
         raise RuntimeError("实时音频数据格式错误：float32 bytes length not multiple of 4。")
     with _realtime_lock:
         session = _realtime_sessions.get(session_id)
         if not session:
-            return b"", 0.0, 0.0, []
-        session["pcm"].extend(pcm)
+            return [], None, "missing"
+        if payload:
+            session["latest_payload"] = payload
         session["updated_at"] = time.time()
+        if not _speaker_enabled():
+            session["speaker_status"] = "off"
+            return [], None, "off"
+        session["pcm"].extend(pcm)
         pcm_bytes = bytes(session["pcm"])
         duration = _pcm_duration(pcm_bytes)
         last_duration = float(session.get("last_speaker_duration") or 0)
         cached_segments = list(session.get("speaker_segments") or [])
-    return pcm_bytes, duration, last_duration, cached_segments
+        if duration < REALTIME_SPEAKER_MIN_AUDIO_SEC:
+            session["speaker_status"] = "collecting"
+            return cached_segments, None, "collecting"
+        if bool(session.get("speaker_running")):
+            session["speaker_status"] = "analyzing"
+            return cached_segments, None, "analyzing"
+        if duration - last_duration < REALTIME_SPEAKER_INTERVAL_SEC:
+            status = "ready" if cached_segments else "waiting"
+            session["speaker_status"] = status
+            return cached_segments, None, status
+        session["speaker_running"] = True
+        session["speaker_status"] = "analyzing"
+        return cached_segments, (pcm_bytes, duration), "analyzing"
 
 
-async def _update_qwen_speaker_segments(session_id: str, pcm: bytes) -> list[TranscriptSegment]:
-    pcm_bytes, duration, last_duration, cached_segments = _append_qwen_speaker_audio(session_id, pcm)
-    if not pcm_bytes:
-        return []
-    if duration < REALTIME_SPEAKER_MIN_AUDIO_SEC or duration - last_duration < REALTIME_SPEAKER_INTERVAL_SEC:
-        return cached_segments
+async def _refresh_qwen_speaker_segments(session_id: str, pcm_bytes: bytes, duration: float) -> None:
+    try:
+        segments = await asyncio.to_thread(_transcribe_realtime_funasr_sync, f"{session_id}-speaker", pcm_bytes)
+        speaker_segments = [item for item in segments if item.speaker is not None]
+        with _realtime_lock:
+            session = _realtime_sessions.get(session_id)
+            if session is not None:
+                session["speaker_segments"] = speaker_segments
+                session["last_speaker_duration"] = duration
+                session["speaker_running"] = False
+                session["speaker_revision"] = int(session.get("speaker_revision") or 0) + 1
+                session["speaker_status"] = "ready" if speaker_segments else "ready_empty"
+    except Exception as exc:
+        with _realtime_lock:
+            session = _realtime_sessions.get(session_id)
+            if session is not None:
+                session["speaker_running"] = False
+                session["speaker_status"] = f"error: {exc}"
 
-    segments = await asyncio.to_thread(_transcribe_realtime_funasr_sync, f"{session_id}-speaker", pcm_bytes)
-    speaker_segments = [item for item in segments if item.speaker is not None]
+
+def _qwen_status_payload(session_id: str) -> dict[str, Any]:
     with _realtime_lock:
         session = _realtime_sessions.get(session_id)
-        if session is not None:
-            session["speaker_segments"] = speaker_segments
-            session["last_speaker_duration"] = duration
-    return speaker_segments
+        if not session:
+            return {"language": "", "text": "", "segments": [], "speaker_ready": False, "speaker_status": "missing"}
+        payload = _qwen_combined_from_session(session)
+        session["latest_payload"] = payload
+        return payload
 
 
-def _finish_qwen_speaker_session(session_id: str) -> tuple[bytes, list[TranscriptSegment]]:
-    if REALTIME_SPEAKER_PROVIDER not in {"funasr_campp", "funasr", "campp"}:
-        return b"", []
+def _finish_qwen_session(session_id: str) -> dict[str, Any]:
     with _realtime_lock:
         session = _realtime_sessions.pop(session_id, None)
     if not session:
-        return b"", []
-    return bytes(session.get("pcm") or b""), list(session.get("speaker_segments") or [])
+        return {}
+    session = dict(session)
+    session["pcm"] = bytes(session.get("pcm") or b"")
+    session["speaker_segments"] = list(session.get("speaker_segments") or [])
+    session["qwen_finished_segments"] = list(session.get("qwen_finished_segments") or [])
+    return session
 
 
 async def _stream_start_funasr() -> str:
@@ -478,6 +589,39 @@ async def _stream_finish_funasr(session_id: str) -> dict[str, Any]:
     return _realtime_payload(segments)
 
 
+async def _qwen_start_remote() -> str:
+    async with httpx.AsyncClient(timeout=ASR_STREAM_START_TIMEOUT_SEC) as client:
+        response = await client.post(f"{ASR_STREAM_BASE_URL}/api/start")
+        if response.status_code >= 400:
+            raise RuntimeError(f"流式 ASR 启动失败 {response.status_code}: {response.text}")
+        return str(response.json()["session_id"])
+
+
+async def _qwen_chunk_remote(qwen_session_id: str, pcm: bytes) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=ASR_STREAM_CHUNK_TIMEOUT_SEC) as client:
+        response = await client.post(
+            f"{ASR_STREAM_BASE_URL}/api/chunk",
+            params={"session_id": qwen_session_id},
+            content=pcm,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        if response.status_code == 409:
+            return {"language": "", "text": "", "segments": []}
+        if response.status_code >= 400:
+            raise RuntimeError(f"流式 ASR 识别失败 {response.status_code}: {response.text}")
+        return response.json()
+
+
+async def _qwen_finish_remote(qwen_session_id: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=ASR_STREAM_FINISH_TIMEOUT_SEC) as client:
+        response = await client.post(f"{ASR_STREAM_BASE_URL}/api/finish", params={"session_id": qwen_session_id})
+        if response.status_code == 409:
+            return {"language": "", "text": "", "segments": []}
+        if response.status_code >= 400:
+            raise RuntimeError(f"流式 ASR 收尾失败 {response.status_code}: {response.text}")
+        return response.json()
+
+
 async def summarize_meeting(title: str, transcript_text: str) -> str:
     if not LLM_BASE_URL:
         raise RuntimeError("未配置 LLM_BASE_URL，无法生成真实 AI 纪要。")
@@ -520,38 +664,100 @@ async def summarize_meeting(title: str, transcript_text: str) -> str:
 async def stream_start() -> str:
     if REALTIME_ASR_PROVIDER == "funasr":
         return await _stream_start_funasr()
+    session_id = uuid.uuid4().hex
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(f"{ASR_STREAM_BASE_URL}/api/start")
-            if response.status_code >= 400:
-                raise RuntimeError(f"流式 ASR 启动失败 {response.status_code}: {response.text}")
-            session_id = str(response.json()["session_id"])
-            _start_qwen_speaker_session(session_id)
-            return session_id
+        qwen_session_id = await _qwen_start_remote()
+        _start_qwen_session(session_id, qwen_session_id)
+        return session_id
     except httpx.TimeoutException as exc:
         raise RuntimeError("流式 ASR 启动超时，可能有旧录音会话正在占用模型，请稍后重试。") from exc
     except httpx.RequestError as exc:
         raise RuntimeError(f"流式 ASR 服务连接失败: {exc}") from exc
 
 
+def _qwen_session_snapshot(session_id: str) -> dict[str, Any] | None:
+    with _realtime_lock:
+        session = _realtime_sessions.get(session_id)
+        return dict(session) if session else None
+
+
+def _qwen_combined_from_session(session: dict[str, Any], current_payload: dict[str, Any] | None = None, speaker_status: str | None = None) -> dict[str, Any]:
+    payload = current_payload if current_payload is not None else dict(session.get("qwen_current_payload") or {})
+    return _qwen_combined_payload(
+        payload,
+        list(session.get("qwen_finished_segments") or []),
+        float(session.get("qwen_offset") or 0.0),
+        str(session.get("qwen_session_id") or "qwen"),
+        list(session.get("speaker_segments") or []),
+        str(speaker_status if speaker_status is not None else session.get("speaker_status") or ""),
+    )
+
+
+async def _rotate_qwen_session_if_needed(session_id: str) -> None:
+    snapshot = _qwen_session_snapshot(session_id)
+    if not snapshot:
+        return
+    current_duration = float(snapshot.get("qwen_current_duration") or 0.0)
+    qwen_session_id = str(snapshot.get("qwen_session_id") or "")
+    if not qwen_session_id or current_duration < REALTIME_QWEN_ROTATE_SEC:
+        return
+
+    current_payload = dict(snapshot.get("qwen_current_payload") or {})
+    try:
+        final_payload = await _qwen_finish_remote(qwen_session_id)
+    except Exception:
+        final_payload = current_payload
+    final_segments = _qwen_payload_segments(final_payload, float(snapshot.get("qwen_offset") or 0.0), qwen_session_id)
+    next_qwen_session_id = await _qwen_start_remote()
+
+    with _realtime_lock:
+        session = _realtime_sessions.get(session_id)
+        if session is not None and session.get("qwen_session_id") == qwen_session_id:
+            session["qwen_finished_segments"] = list(session.get("qwen_finished_segments") or []) + final_segments
+            session["qwen_offset"] = round(float(session.get("qwen_offset") or 0.0) + current_duration, 2)
+            session["qwen_current_duration"] = 0.0
+            session["qwen_current_payload"] = {}
+            session["qwen_session_id"] = next_qwen_session_id
+            session["updated_at"] = time.time()
+
+
 async def stream_chunk(session_id: str, pcm: bytes) -> dict[str, Any]:
     if REALTIME_ASR_PROVIDER == "funasr":
         return await _stream_chunk_funasr(session_id, pcm)
+    if len(pcm) % 4 != 0:
+        raise RuntimeError("实时音频数据格式错误：float32 bytes length not multiple of 4。")
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(
-                f"{ASR_STREAM_BASE_URL}/api/chunk",
-                params={"session_id": session_id},
-                content=pcm,
-                headers={"Content-Type": "application/octet-stream"},
-            )
-            if response.status_code == 409:
+        await _rotate_qwen_session_if_needed(session_id)
+        snapshot = _qwen_session_snapshot(session_id)
+        if not snapshot:
+            return {"language": "", "text": "", "segments": []}
+        qwen_session_id = str(snapshot.get("qwen_session_id") or "")
+        if not qwen_session_id:
+            return {"language": "", "text": "", "segments": []}
+
+        payload = await _qwen_chunk_remote(qwen_session_id, pcm)
+        chunk_duration = _pcm_duration(pcm)
+        with _realtime_lock:
+            session = _realtime_sessions.get(session_id)
+            if not session:
                 return {"language": "", "text": "", "segments": []}
-            if response.status_code >= 400:
-                raise RuntimeError(f"流式 ASR 识别失败 {response.status_code}: {response.text}")
-            payload = response.json()
-            speaker_segments = await _update_qwen_speaker_segments(session_id, pcm)
-            return _qwen_stream_payload(payload, speaker_segments)
+            if session.get("qwen_session_id") != qwen_session_id:
+                return _qwen_combined_from_session(session)
+            session["qwen_current_duration"] = round(float(session.get("qwen_current_duration") or 0.0) + chunk_duration, 2)
+            session["qwen_current_payload"] = payload
+            session["updated_at"] = time.time()
+            finished_segments = list(session.get("qwen_finished_segments") or [])
+            offset = float(session.get("qwen_offset") or 0.0)
+
+        speaker_segments, speaker_work, speaker_status = _record_qwen_chunk(session_id, pcm, {})
+        result = _qwen_combined_payload(payload, finished_segments, offset, qwen_session_id, speaker_segments, speaker_status)
+        with _realtime_lock:
+            session = _realtime_sessions.get(session_id)
+            if session is not None:
+                session["latest_payload"] = result
+        if speaker_work:
+            asyncio.create_task(_refresh_qwen_speaker_segments(session_id, speaker_work[0], speaker_work[1]))
+        return result
     except httpx.TimeoutException as exc:
         raise RuntimeError("流式 ASR 识别超时。") from exc
     except httpx.RequestError as exc:
@@ -561,21 +767,42 @@ async def stream_chunk(session_id: str, pcm: bytes) -> dict[str, Any]:
 async def stream_finish(session_id: str) -> dict[str, Any]:
     if REALTIME_ASR_PROVIDER == "funasr":
         return await _stream_finish_funasr(session_id)
-    pcm_bytes, cached_speaker_segments = _finish_qwen_speaker_session(session_id)
-    speaker_segments = cached_speaker_segments
-    if pcm_bytes and _pcm_duration(pcm_bytes) >= REALTIME_SPEAKER_MIN_AUDIO_SEC and REALTIME_SPEAKER_PROVIDER in {"funasr_campp", "funasr", "campp"}:
-        speaker_segments = await asyncio.to_thread(_transcribe_realtime_funasr_sync, f"{session_id}-speaker-final", pcm_bytes)
-        speaker_segments = [item for item in speaker_segments if item.speaker is not None]
+    session = _finish_qwen_session(session_id)
+    if not session:
+        return {"language": "", "text": "", "segments": []}
+
+    qwen_session_id = str(session.get("qwen_session_id") or "")
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(f"{ASR_STREAM_BASE_URL}/api/finish", params={"session_id": session_id})
-            if response.status_code == 409:
-                return {"language": "", "text": "", "segments": []}
-            if response.status_code >= 400:
-                raise RuntimeError(f"流式 ASR 收尾失败 {response.status_code}: {response.text}")
-            payload = response.json()
-            return _qwen_stream_payload(payload, speaker_segments)
-    except httpx.TimeoutException as exc:
-        raise RuntimeError("流式 ASR 收尾超时，已释放本地录音状态。") from exc
-    except httpx.RequestError as exc:
-        raise RuntimeError(f"流式 ASR 服务连接失败: {exc}") from exc
+        payload = await _qwen_finish_remote(qwen_session_id) if qwen_session_id else dict(session.get("qwen_current_payload") or {})
+    except Exception:
+        payload = dict(session.get("qwen_current_payload") or {})
+
+    speaker_segments = list(session.get("speaker_segments") or [])
+    pcm_bytes = bytes(session.get("pcm") or b"")
+    if pcm_bytes and _pcm_duration(pcm_bytes) >= REALTIME_SPEAKER_MIN_AUDIO_SEC and _speaker_enabled():
+        try:
+            speaker_segments = await asyncio.to_thread(_transcribe_realtime_funasr_sync, f"{session_id}-speaker-final", pcm_bytes)
+            speaker_segments = [item for item in speaker_segments if item.speaker is not None]
+        except Exception:
+            pass
+
+    return _qwen_combined_payload(
+        payload,
+        list(session.get("qwen_finished_segments") or []),
+        float(session.get("qwen_offset") or 0.0),
+        qwen_session_id or session_id,
+        speaker_segments,
+        "final",
+    )
+
+
+async def stream_status(session_id: str) -> dict[str, Any]:
+    if REALTIME_ASR_PROVIDER == "funasr":
+        with _realtime_lock:
+            session = _realtime_sessions.get(session_id)
+            segments = list(session.get("segments") or []) if session else []
+        payload = _realtime_payload(segments)
+        payload["speaker_ready"] = any(item.speaker is not None for item in segments)
+        payload["speaker_status"] = "ready" if segments else "collecting"
+        return payload
+    return _qwen_status_payload(session_id)

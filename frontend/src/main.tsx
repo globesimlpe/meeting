@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { FileAudio, Files, Loader2, Mic, Plus, RefreshCw, Sparkles, Square, Upload, Users } from "lucide-react";
+import { Activity, FileAudio, Files, Loader2, Mic, Plus, RefreshCw, Sparkles, Square, Upload, Users } from "lucide-react";
 import "./styles.css";
 
 type Meeting = {
@@ -30,6 +30,8 @@ type TranscriptionResult = {
   text: string;
   segments: Segment[];
   files?: string[];
+  speaker_ready?: boolean;
+  speaker_status?: string;
 };
 
 type SummaryResult = {
@@ -40,9 +42,18 @@ type StreamStartResult = {
   session_id: string;
 };
 
+type ProcessLogItem = {
+  id: string;
+  at: string;
+  title: string;
+  detail: string;
+  tone?: "info" | "success" | "warning" | "danger";
+};
+
 const API_BASE = "/api";
 const TARGET_SAMPLE_RATE = 16000;
 const STREAM_CHUNK_SAMPLES = TARGET_SAMPLE_RATE * 0.5;
+const PROCESS_LOG_STORAGE_KEY = "meeting-ai-process-log-v1";
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, init);
@@ -108,6 +119,28 @@ function transcriptText(segments: Segment[]) {
   return segments.map(formatSegmentLine).filter(Boolean).join("\n");
 }
 
+function segmentSignature(segments: Segment[]) {
+  return segments.map((item) => `${item.id}:${item.start}:${item.end}:${item.speaker ?? "?"}:${item.text}`).join("|");
+}
+
+function speakerSignature(segments: Segment[]) {
+  return segments.map((item) => `${item.id}:${item.speaker ?? "?"}`).join("|");
+}
+
+function readProcessLogs() {
+  try {
+    const raw = window.localStorage.getItem(PROCESS_LOG_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, ProcessLogItem[]>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeProcessLogs(logs: Record<string, ProcessLogItem[]>) {
+  window.localStorage.setItem(PROCESS_LOG_STORAGE_KEY, JSON.stringify(logs));
+}
+
 function canUseMicrophone() {
   const mediaDevices = (navigator as Navigator & { mediaDevices?: MediaDevices }).mediaDevices;
   return Boolean(mediaDevices && typeof mediaDevices.getUserMedia === "function" && window.isSecureContext);
@@ -155,6 +188,28 @@ function TranscriptFeed({ segments, className = "", emptyTitle, emptyText }: { s
   );
 }
 
+function ProcessLog({ items }: { items: ProcessLogItem[] }) {
+  return (
+    <div className="process-log">
+      {items.map((item) => (
+        <article className={`process-item ${item.tone || "info"}`} key={item.id}>
+          <time>{formatTime(item.at)}</time>
+          <div>
+            <strong>{item.title}</strong>
+            <p>{item.detail}</p>
+          </div>
+        </article>
+      ))}
+      {items.length === 0 && (
+        <div className="empty-transcript process-empty">
+          <strong>暂无流程记录</strong>
+          <span>创建会议、实时录音、上传音频和生成纪要时会自动记录。</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [selectedId, setSelectedId] = useState("");
@@ -169,6 +224,7 @@ function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [isStartingRecording, setIsStartingRecording] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [processLogs, setProcessLogs] = useState<Record<string, ProcessLogItem[]>>(() => readProcessLogs());
   const microphoneReady = canUseMicrophone();
 
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -184,10 +240,16 @@ function App() {
   const selectedIdRef = useRef("");
   const recordingActiveRef = useRef(false);
   const liveStartedAtRef = useRef(0);
+  const streamPollTimerRef = useRef(0);
+  const qwenTextLoggedRef = useRef(false);
+  const speakerReadyLoggedRef = useRef(false);
+  const speakerSignatureRef = useRef("");
+  const segmentSignatureRef = useRef("");
 
   const activeSegments = detail?.transcript || [];
   const currentTranscript = useMemo(() => transcriptText(detail?.transcript || []), [detail]);
   const activeText = streamText || uploadText || currentTranscript;
+  const activeLogs = selectedId ? processLogs[selectedId] || [] : [];
 
   async function runBusy<T>(name: string, fn: () => Promise<T>) {
     setBusy(name);
@@ -200,6 +262,79 @@ function App() {
     } finally {
       setBusy("");
     }
+  }
+
+  function addProcessLog(meetingId: string, title: string, detailText: string, tone: ProcessLogItem["tone"] = "info") {
+    if (!meetingId) return;
+    setProcessLogs((current) => {
+      const nextItem: ProcessLogItem = {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        at: new Date().toISOString(),
+        title,
+        detail: detailText,
+        tone,
+      };
+      const next = {
+        ...current,
+        [meetingId]: [nextItem, ...(current[meetingId] || [])].slice(0, 80),
+      };
+      writeProcessLogs(next);
+      return next;
+    });
+  }
+
+  function applyLiveResult(meetingId: string, sessionId: string, result: TranscriptionResult, source: "qwen" | "speaker" | "final") {
+    if (streamSessionIdRef.current !== sessionId && source !== "final") return;
+    const elapsed = liveStartedAtRef.current ? (Date.now() - liveStartedAtRef.current) / 1000 : 0;
+    const nextSegments = result.segments?.length
+      ? result.segments
+      : result.text.trim()
+        ? [{ id: `live-${sessionId}`, start: 0, end: elapsed, text: result.text.trim(), language: "zh", speaker: 0, source: "实时会议" }]
+        : [];
+    const nextSegmentSignature = segmentSignature(nextSegments);
+    if (nextSegmentSignature && nextSegmentSignature !== segmentSignatureRef.current) {
+      segmentSignatureRef.current = nextSegmentSignature;
+      setLiveSegments(nextSegments);
+      setStreamText(transcriptText(nextSegments));
+    } else if (nextSegments.length === 0) {
+      setLiveSegments([]);
+      setStreamText("");
+    }
+
+    if (source === "qwen" && nextSegments.length && !qwenTextLoggedRef.current) {
+      qwenTextLoggedRef.current = true;
+      addProcessLog(meetingId, "Qwen ASR 已输出文字", `已产生 ${nextSegments.length} 句实时转写，speaker 结果等待 CAM++ 修正。`, "success");
+    }
+
+    const nextSpeakerSignature = speakerSignature(nextSegments);
+    const speakerChanged = nextSpeakerSignature && speakerSignatureRef.current && nextSpeakerSignature !== speakerSignatureRef.current;
+    if (nextSpeakerSignature) speakerSignatureRef.current = nextSpeakerSignature;
+    if (result.speaker_ready && !speakerReadyLoggedRef.current) {
+      speakerReadyLoggedRef.current = true;
+      addProcessLog(meetingId, "FunASR CAM++ 已返回说话人", `已按时间重叠修正 ${nextSegments.length} 句 speaker 标签。`, "success");
+    } else if (source === "speaker" && result.speaker_ready && speakerChanged) {
+      addProcessLog(meetingId, "说话人标签已更新", `CAM++ 重新对齐了 ${nextSegments.length} 句实时转写。`, "info");
+    }
+  }
+
+  function stopStreamStatusPolling() {
+    if (streamPollTimerRef.current) {
+      window.clearInterval(streamPollTimerRef.current);
+      streamPollTimerRef.current = 0;
+    }
+  }
+
+  function startStreamStatusPolling(meetingId: string, sessionId: string) {
+    stopStreamStatusPolling();
+    streamPollTimerRef.current = window.setInterval(() => {
+      if (streamSessionIdRef.current !== sessionId) {
+        stopStreamStatusPolling();
+        return;
+      }
+      api<TranscriptionResult>(`/meetings/${meetingId}/stream/status?session_id=${encodeURIComponent(sessionId)}`)
+        .then((result) => applyLiveResult(meetingId, sessionId, result, "speaker"))
+        .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+    }, 1500);
   }
 
   async function loadMeetings(nextSelectedId?: string) {
@@ -233,6 +368,7 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: title.trim() }),
       });
+      addProcessLog(meeting.id, "创建会议", `会议“${meeting.title}”已创建。`, "success");
       setTitle("");
       setUploadText("");
       setStreamText("");
@@ -245,12 +381,14 @@ function App() {
   async function uploadAudio(file: File) {
     if (!detail) return;
     await runBusy("upload", async () => {
+      addProcessLog(detail.meeting.id, "上传单个音频", `开始处理 ${file.name}。`, "info");
       const body = new FormData();
       body.append("file", file);
       const result = await api<TranscriptionResult>(`/meetings/${detail.meeting.id}/audio`, {
         method: "POST",
         body,
       });
+      addProcessLog(detail.meeting.id, "音频转写完成", `FunASR 输出 ${result.segments.length} 句，包含时间戳和说话人。`, "success");
       setUploadText(result.text);
       setStreamText("");
       setLiveSegments([]);
@@ -262,12 +400,14 @@ function App() {
   async function uploadAudioBatch(files: FileList) {
     if (!detail || files.length === 0) return;
     await runBusy("batch", async () => {
+      addProcessLog(detail.meeting.id, "批量音频处理", `开始处理 ${files.length} 个文件。`, "info");
       const body = new FormData();
       Array.from(files).forEach((file) => body.append("files", file));
       const result = await api<TranscriptionResult>(`/meetings/${detail.meeting.id}/audio/batch`, {
         method: "POST",
         body,
       });
+      addProcessLog(detail.meeting.id, "批量转写完成", `已处理 ${result.files?.length || files.length} 个文件，输出 ${result.segments.length} 句。`, "success");
       setUploadText(result.text);
       setStreamText("");
       setLiveSegments([]);
@@ -317,16 +457,7 @@ function App() {
       headers: { "Content-Type": "application/octet-stream" },
       body,
     });
-    if (streamSessionIdRef.current === sessionId) {
-      const elapsed = liveStartedAtRef.current ? (Date.now() - liveStartedAtRef.current) / 1000 : 0;
-      const nextSegments = result.segments?.length
-        ? result.segments
-        : result.text.trim()
-          ? [{ id: `live-${sessionId}`, start: 0, end: elapsed, text: result.text.trim(), language: "zh", speaker: 0, source: "实时会议" }]
-          : [];
-      setLiveSegments(nextSegments);
-      setStreamText(transcriptText(nextSegments));
-    }
+    applyLiveResult(id, sessionId, result, "qwen");
   }
 
   async function pumpStreamQueue() {
@@ -365,15 +496,22 @@ function App() {
     bufferedSamplesRef.current = [];
     pendingChunksRef.current = [];
     isPushingRef.current = false;
+    qwenTextLoggedRef.current = false;
+    speakerReadyLoggedRef.current = false;
+    speakerSignatureRef.current = "";
+    segmentSignatureRef.current = "";
     setIsStartingRecording(true);
     let stream: MediaStream | null = null;
     try {
+      addProcessLog(detail.meeting.id, "启动实时会议", "正在连接 Qwen ASR，并准备 FunASR CAM++ 滚动说话人识别。", "info");
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const started = await api<StreamStartResult>(`/meetings/${detail.meeting.id}/stream/start`, { method: "POST" });
       streamMeetingIdRef.current = detail.meeting.id;
       streamSessionIdRef.current = started.session_id;
       recordingActiveRef.current = true;
       liveStartedAtRef.current = Date.now();
+      addProcessLog(detail.meeting.id, "实时通道已建立", `session ${started.session_id.slice(0, 8)} 已启动，开始采集 16k mono PCM。`, "success");
+      startStreamStatusPolling(detail.meeting.id, started.session_id);
       setElapsedSeconds(0);
       const AudioContextClass = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
       if (!AudioContextClass) throw new Error("当前浏览器不支持 AudioContext。");
@@ -401,7 +539,9 @@ function App() {
       streamSessionIdRef.current = "";
       streamMeetingIdRef.current = "";
       recordingActiveRef.current = false;
+      stopStreamStatusPolling();
       stream?.getTracks().forEach((track) => track.stop());
+      if (detail) addProcessLog(detail.meeting.id, "实时会议启动失败", err instanceof Error ? err.message : String(err), "danger");
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsStartingRecording(false);
@@ -412,6 +552,8 @@ function App() {
   function stopRecording() {
     const meetingId = streamMeetingIdRef.current;
     const sessionId = streamSessionIdRef.current;
+    if (meetingId) addProcessLog(meetingId, "停止实时会议", "正在推送剩余音频并等待最终转写。", "warning");
+    stopStreamStatusPolling();
     recordingActiveRef.current = false;
     setIsRecording(false);
     processorRef.current?.disconnect();
@@ -432,13 +574,15 @@ function App() {
           120000,
           "停止录音超时，已释放本地录音状态。"
         );
-        const finalSegments = result.segments?.length ? result.segments : [];
-        setLiveSegments(finalSegments);
-        setStreamText(transcriptText(finalSegments));
+        applyLiveResult(meetingId, sessionId, result, "final");
+        addProcessLog(meetingId, "实时转写完成", `最终输出 ${result.segments?.length || 0} 句，已写入当前会议文字。`, "success");
       }
     };
 
-    finish().catch((err) => setError(err instanceof Error ? err.message : String(err))).finally(() => {
+    finish().catch((err) => {
+      if (meetingId) addProcessLog(meetingId, "实时转写收尾失败", err instanceof Error ? err.message : String(err), "danger");
+      setError(err instanceof Error ? err.message : String(err));
+    }).finally(() => {
       audioContextRef.current?.close();
       processorRef.current = null;
       sourceRef.current = null;
@@ -458,8 +602,10 @@ function App() {
   async function generateSummary() {
     if (!detail) return;
     await runBusy("summary", async () => {
+      addProcessLog(detail.meeting.id, "生成 AI 纪要", "正在调用本地 Qwen 大模型整理摘要、结论和待办。", "info");
       const result = await api<SummaryResult>(`/meetings/${detail.meeting.id}/summary`, { method: "POST" });
       setSummaryText(result.summary);
+      addProcessLog(detail.meeting.id, "AI 纪要已生成", "会议摘要、关键结论和待跟进事项已更新。", "success");
       await loadDetail(detail.meeting.id);
     });
   }
@@ -471,6 +617,7 @@ function App() {
   useEffect(() => {
     loadMeetings().catch((err) => setError(String(err)));
     return () => {
+      stopStreamStatusPolling();
       processorRef.current?.disconnect();
       sourceRef.current?.disconnect();
       monitorGainRef.current?.disconnect();
@@ -500,7 +647,7 @@ function App() {
           <Mic size={26} />
           <div>
             <strong>AI 会议转写</strong>
-            <span>FunASR 实时转写 / 批量处理 / AI 纪要</span>
+            <span>Qwen 实时转写 / CAM++ 说话人修正 / AI 纪要</span>
           </div>
         </div>
 
@@ -560,7 +707,7 @@ function App() {
                 <h2>实时转写</h2>
                 <span>
                   {isRecording
-                    ? "麦克风录音中，约 500ms 推送一次"
+                    ? "Qwen 快速输出文字，CAM++ 后台修正说话人"
                     : isStartingRecording
                       ? "正在启动实时转写"
                       : microphoneReady
@@ -588,12 +735,12 @@ function App() {
             </div>
             <div className="live-statusbar">
               <div className="timer-display">{formatSeconds(elapsedSeconds)}</div>
-              <span>{liveSegments.length ? `${liveSegments.length} 句实时转写` : "等待发言"}</span>
+              <span>{liveSegments.length ? `${liveSegments.length} 句实时转写，speaker 后台更新` : "等待发言"}</span>
             </div>
             <TranscriptFeed
               className="live-output"
               emptyTitle="等待会议发言"
-              emptyText="开始会议后，FunASR 会准实时输出带时间戳和说话人的会议转写。"
+              emptyText="开始会议后，Qwen 会先输出转写；FunASR CAM++ 返回后会自动修正说话人。"
               segments={liveSegments}
             />
           </section>
@@ -638,6 +785,17 @@ function App() {
               </label>
             </div>
             <textarea className="output" value={uploadText} readOnly placeholder="FunASR 处理后的带时间戳转写会输出到这里。" />
+          </section>
+
+          <section className="panel process-panel">
+            <div className="panel-head">
+              <div>
+                <h2>会议流程记录</h2>
+                <span>记录实时通道、文字输出、说话人修正、上传处理和纪要生成</span>
+              </div>
+              <Activity size={22} />
+            </div>
+            <ProcessLog items={activeLogs} />
           </section>
 
           <section className="panel transcript-panel">

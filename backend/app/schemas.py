@@ -31,6 +31,8 @@ class AudioTranscriptionResult(BaseModel):
     text: str
     segments: list[TranscriptSegment] = []
     files: list[str] = []
+    speaker_ready: bool = False
+    speaker_status: str = ""
 
 
 class SummaryResult(BaseModel):

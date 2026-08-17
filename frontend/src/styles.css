@@ -290,6 +290,10 @@ p {
   grid-column: 1 / -1;
 }
 
+.process-panel {
+  grid-column: 1 / -1;
+}
+
 .transcript-output {
   min-height: 280px;
 }
@@ -304,6 +308,65 @@ p {
   max-height: 460px;
   overflow: auto;
   padding: 14px;
+}
+
+.process-log {
+  background: #f8fafb;
+  border: 1px solid #d8e0e7;
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 14px;
+}
+
+.process-item {
+  background: #ffffff;
+  border: 1px solid #d8e0e7;
+  border-left: 4px solid #6f7f8d;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 150px minmax(0, 1fr);
+  padding: 12px;
+}
+
+.process-item.success {
+  border-left-color: #24745d;
+}
+
+.process-item.warning {
+  border-left-color: #c7831f;
+}
+
+.process-item.danger {
+  border-left-color: #ab3f32;
+}
+
+.process-item time {
+  color: #6f7f8d;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.5;
+}
+
+.process-item strong {
+  color: #172029;
+  display: block;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.process-item p {
+  color: #546574;
+  line-height: 1.6;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.process-empty {
+  min-height: 150px;
 }
 
 .transcript-item {
@@ -487,6 +550,10 @@ p {
   }
 
   .transcript-item {
+    grid-template-columns: 1fr;
+  }
+
+  .process-item {
     grid-template-columns: 1fr;
   }
 

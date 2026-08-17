@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import asyncio
 import threading
 import time
 import uuid
@@ -30,6 +31,9 @@ MAX_NUM_BATCHED_TOKENS = int(os.getenv("ASR_STREAM_MAX_NUM_BATCHED_TOKENS", "102
 TMP_DIR = Path(os.getenv("ASR_STREAM_TMP_DIR", "/tmp/meeting-ai-asr"))
 SAMPLE_RATE = int(os.getenv("ASR_STREAM_SAMPLE_RATE", "16000"))
 SEGMENT_MAX_CHARS = int(os.getenv("ASR_STREAM_SEGMENT_MAX_CHARS", "42"))
+START_TIMEOUT_SEC = float(os.getenv("ASR_STREAM_START_TIMEOUT_SEC", "20"))
+CHUNK_TIMEOUT_SEC = float(os.getenv("ASR_STREAM_CHUNK_TIMEOUT_SEC", "45"))
+FINISH_TIMEOUT_SEC = float(os.getenv("ASR_STREAM_FINISH_TIMEOUT_SEC", "45"))
 
 
 app = FastAPI(title="Qwen ASR Low Latency Streaming", version="1.0.0")
@@ -73,6 +77,14 @@ def _get_session(session_id: str) -> Session:
 
 def _error_detail(exc: Exception, fallback: str) -> str:
     return str(exc).strip() or fallback
+
+
+async def _run_asr_locked(func: Any, *args: Any, timeout: float, **kwargs: Any) -> Any:
+    def call() -> Any:
+        with asr_lock:
+            return func(*args, **kwargs)
+
+    return await asyncio.wait_for(asyncio.to_thread(call), timeout=timeout)
 
 
 def _clean_stream_text(text: str) -> str:
@@ -192,16 +204,20 @@ def transcriptions(
 
 
 @app.post("/api/start")
-def start() -> dict[str, str]:
+async def start() -> dict[str, str]:
     if asr is None:
         raise HTTPException(status_code=503, detail="ASR model not ready")
     session_id = uuid.uuid4().hex
     try:
-        state = asr.init_streaming_state(
+        state = await _run_asr_locked(
+            asr.init_streaming_state,
             unfixed_chunk_num=UNFIXED_CHUNK_NUM,
             unfixed_token_num=UNFIXED_TOKEN_NUM,
             chunk_size_sec=CHUNK_SIZE_SEC,
+            timeout=START_TIMEOUT_SEC,
         )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="ASR 流式会话初始化超时。") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_error_detail(exc, "ASR 流式会话初始化失败。")) from exc
     now = time.time()
@@ -225,8 +241,9 @@ async def chunk(request: Request, session_id: str = Query(...)) -> dict[str, Any
     pcm = np.frombuffer(raw, dtype=np.float32).reshape(-1)
     session.audio_seconds += float(pcm.shape[0]) / SAMPLE_RATE
     try:
-        with asr_lock:
-            asr.streaming_transcribe(pcm, session.state)
+        await _run_asr_locked(asr.streaming_transcribe, pcm, session.state, timeout=CHUNK_TIMEOUT_SEC)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="ASR 流式识别超时。") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_error_detail(exc, "ASR 流式识别失败。")) from exc
 
@@ -241,7 +258,7 @@ async def chunk(request: Request, session_id: str = Query(...)) -> dict[str, Any
 
 
 @app.post("/api/finish")
-def finish(session_id: str = Query(...)) -> dict[str, Any]:
+async def finish(session_id: str = Query(...)) -> dict[str, Any]:
     if asr is None:
         raise HTTPException(status_code=503, detail="ASR model not ready")
     try:
@@ -251,8 +268,9 @@ def finish(session_id: str = Query(...)) -> dict[str, Any]:
             return {"language": "", "text": "", "segments": []}
         raise
     try:
-        with asr_lock:
-            asr.finish_streaming_transcribe(session.state)
+        await _run_asr_locked(asr.finish_streaming_transcribe, session.state, timeout=FINISH_TIMEOUT_SEC)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="ASR 流式收尾超时。") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_error_detail(exc, "ASR 流式收尾失败。")) from exc
     language = getattr(session.state, "language", "") or "zh"
@@ -266,3 +284,25 @@ def finish(session_id: str = Query(...)) -> dict[str, Any]:
     with sessions_lock:
         SESSIONS.pop(session_id, None)
     return output
+
+
+@app.delete("/api/session")
+def delete_session(session_id: str = Query(...)) -> dict[str, Any]:
+    with sessions_lock:
+        existed = SESSIONS.pop(session_id, None) is not None
+    return {"released": existed, "session_id": session_id}
+
+
+@app.post("/api/reset")
+def reset_sessions(max_age_sec: float = Query(default=0)) -> dict[str, Any]:
+    now = time.time()
+    with sessions_lock:
+        if max_age_sec <= 0:
+            count = len(SESSIONS)
+            SESSIONS.clear()
+        else:
+            dead = [sid for sid, item in SESSIONS.items() if now - item.last_seen >= max_age_sec]
+            for sid in dead:
+                SESSIONS.pop(sid, None)
+            count = len(dead)
+    return {"released": count}
